@@ -1,0 +1,31 @@
+{
+  "name": "winston-kafka-transport",
+  "version": "1.0.0",
+  "description": "Custom Apache Kafka transport for Winston logger with TypeScript",
+  "main": "dist/kafka-transport.js",
+  "types": "dist/kafka-transport.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node example-usage.ts",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "winston",
+    "kafka",
+    "logging",
+    "transport",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "winston": "^3.18.3",
+    "winston-transport": "^4.9.0"
+  }
+}
