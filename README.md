@@ -5,8 +5,9 @@ A fully-typed Apache Kafka transport for Winston logger built with TypeScript.
 ## Installation
 
 ```bash
-npm install winston winston-transport kafkajs
-npm install -D typescript @types/node
+npm install @fn3x/winston-kafka-transport
+pnpm add @fn3x/winston-kafka-transport
+yarn add @fn3x/winston-kafka-transport
 ```
 
 ## Features

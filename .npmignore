@@ -1,28 +1,25 @@
-# Source files
 *.ts
 !*.d.ts
 
-# Config files
 tsconfig.json
 
-# Example files
-example-usage.ts
+example.ts
 
-# Development
 node_modules/
 .git/
 .gitignore
 
-# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
 .DS_Store
 Thumbs.db
 
-# Testing
 coverage/
 *.log
+
+flake*
+package-lock.json
+.gitignore
