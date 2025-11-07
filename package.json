@@ -1,5 +1,5 @@
 {
-  "name": "winston-kafka-transport",
+  "name": "@fn3x/winston-transport-kafka",
   "version": "1.0.0",
   "description": "Custom Apache Kafka transport for Winston logger with TypeScript",
   "main": "dist/kafka-transport.js",
@@ -16,8 +16,12 @@
     "transport",
     "typescript"
   ],
-  "author": "",
+  "author": "https://github.com/fn3x",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fn3x/winston-kafka.git"
+  },
   "devDependencies": {
     "@types/node": "^24.10.0",
     "ts-node": "^10.9.2",
