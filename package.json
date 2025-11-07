@@ -1,6 +1,6 @@
 {
-  "name": "@fn3x/winston-transport-kafka",
-  "version": "1.0.0",
+  "name": "@fn3x/winston-kafka-transport",
+  "version": "1.0.1",
   "description": "Custom Apache Kafka transport for Winston logger with TypeScript",
   "main": "dist/kafka-transport.js",
   "types": "dist/kafka-transport.d.ts",
