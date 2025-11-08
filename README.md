@@ -106,6 +106,9 @@ const options: KafkaTransportOptions = {
       retries: 8,
     },
   },
+
+  // Maximum messages to store when disconnected
+  maxQueueSize: 500;
 };
 
 const logger = winston.createLogger({
