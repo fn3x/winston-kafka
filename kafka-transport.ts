@@ -26,6 +26,9 @@ export interface KafkaTransportOptions extends Transport.TransportStreamOptions 
 
   /** Full KafkaJS client configuration (overrides brokers/clientId) */
   kafka?: KafkaConfig;
+
+  /** Maximum messages to queue while disconnected (default: 1000) */
+  maxQueueSize?: number;
 }
 
 /**
@@ -36,6 +39,14 @@ interface FormattedLogMessage {
   level: string;
   message: string;
   [key: string]: any;
+}
+
+/**
+ * Queued log entry waiting to be sent
+ */
+interface QueuedLog {
+  info: LogEntry;
+  callback?: () => void;
 }
 
 /**
@@ -51,6 +62,9 @@ export class KafkaTransport extends Transport {
   private kafka: Kafka;
   private producer: Producer;
   private connected: boolean = false;
+  private connecting: boolean = false;
+  private messageQueue: QueuedLog[] = [];
+  private maxQueueSize: number;
 
   constructor(opts: KafkaTransportOptions = {}) {
     super(opts);
@@ -65,6 +79,8 @@ export class KafkaTransport extends Transport {
     this.topic = opts.topic || 'logs';
     this.keyField = opts.keyField || null;
 
+    this.maxQueueSize = opts.maxQueueSize || 1000;
+
     this.messageFormatter = opts.messageFormatter || this.defaultFormatter.bind(this);
 
     this.kafka = new Kafka(this.kafkaConfig);
@@ -77,13 +93,43 @@ export class KafkaTransport extends Transport {
    * Connect to Kafka broker
    */
   private async connect(): Promise<void> {
+    if (this.connecting || this.connected) return;
+
+    this.connecting = true;
+
     try {
       await this.producer.connect();
       this.connected = true;
+      this.connecting = false;
       this.emit('connected');
+
+      await this.processQueue();
     } catch (error) {
+      this.connecting = false;
       this.emit('error', error);
       setTimeout(() => this.connect(), 5000);
+    }
+  }
+
+  /**
+   * Process queued messages
+   */
+  private async processQueue(): Promise<void> {
+    if (!this.connected || this.messageQueue.length === 0) return;
+
+    const queue = [...this.messageQueue];
+    this.messageQueue = [];
+
+    for (const { info, callback } of queue) {
+      try {
+        await this.sendToKafka(info);
+      } catch (error) {
+        this.emit('error', error);
+      }
+
+      if (callback) {
+        callback();
+      }
     }
   }
 
@@ -102,7 +148,29 @@ export class KafkaTransport extends Transport {
   }
 
   /**
-   * Log method - sends log to Kafka
+   * Send message to Kafka
+   */
+  private async sendToKafka(info: LogEntry): Promise<void> {
+    const messageValue = this.messageFormatter(info);
+
+    const message: Message = {
+      value: JSON.stringify(messageValue),
+    };
+
+    if (this.keyField && info[this.keyField]) {
+      message.key = String(info[this.keyField]);
+    }
+
+    const record: ProducerRecord = {
+      topic: this.topic,
+      messages: [message],
+    };
+
+    await this.producer.send(record);
+  }
+
+  /**
+   * Log method - sends log to Kafka or queues if not connected
    */
   async log(info: LogEntry, callback: () => void): Promise<void> {
     setImmediate(() => {
@@ -110,40 +178,26 @@ export class KafkaTransport extends Transport {
     });
 
     if (!this.connected) {
-      const error = new Error('Kafka producer not connected');
-      if (callback) {
-        callback();
+      if (this.messageQueue.length < this.maxQueueSize) {
+        this.messageQueue.push({ info, callback });
+      } else {
+        const error = new Error(`Message queue full (${this.maxQueueSize} messages). Dropping log.`);
+        this.emit('warn', error);
+        if (callback) {
+          callback();
+        }
       }
-      this.emit('error', error);
       return;
     }
 
     try {
-      const messageValue = this.messageFormatter(info);
-
-      const message: Message = {
-        value: JSON.stringify(messageValue),
-      };
-
-      if (this.keyField && info[this.keyField]) {
-        message.key = String(info[this.keyField]);
-      }
-
-      const record: ProducerRecord = {
-        topic: this.topic,
-        messages: [message],
-      };
-
-      await this.producer.send(record);
-
-      if (callback) {
-        callback();
-      }
+      await this.sendToKafka(info);
     } catch (error) {
       this.emit('error', error);
-      if (callback) {
-        callback();
-      }
+    }
+
+    if (callback) {
+      callback();
     }
   }
 
