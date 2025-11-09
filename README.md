@@ -73,12 +73,12 @@ const options: KafkaTransportOptions = {
   
   // Custom message formatter with full type safety
   messageFormatter: (info) => ({
+    ...info,
     timestamp: info.timestamp || new Date().toISOString(),
     level: info.level,
     message: info.message,
     service: 'my-service',
     environment: process.env.NODE_ENV || 'production',
-    ...info,
   }),
   
   // KafkaJS producer configuration

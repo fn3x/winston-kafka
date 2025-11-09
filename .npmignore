@@ -23,3 +23,5 @@ coverage/
 flake*
 package-lock.json
 .gitignore
+
+.env*
