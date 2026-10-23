@@ -16,6 +16,8 @@ yarn add @fn3x/winston-kafka-transport
 - **Automatic connection management** with retry logic
 - **Configurable message formatting** with type-safe options
 - **Message key support** for Kafka partitioning
+- **Non-blocking** - Kafka outages never stall the logger or other transports
+- **Bounded offline queue** - logs are buffered while disconnected and flushed on reconnect
 - **Error handling** with typed event emitters
 - **Graceful shutdown** capability
 - **Connection status tracking**
@@ -108,7 +110,7 @@ const options: KafkaTransportOptions = {
   },
 
   // Maximum messages to store when disconnected
-  maxQueueSize: 500;
+  maxQueueSize: 500,
 };
 
 const logger = winston.createLogger({
@@ -152,6 +154,8 @@ interface KafkaTransportOptions extends Transport.TransportStreamOptions {
   messageFormatter?: (info: LogEntry) => any;  // Custom formatter
   producerConfig?: ProducerConfig; // KafkaJS producer config
   kafka?: KafkaConfig;            // Full KafkaJS config
+  maxQueueSize?: number;          // Logs buffered while disconnected (default: 1000)
+  reconnectInterval?: number;     // Delay between reconnect attempts in ms (default: 5000)
 }
 ```
 
@@ -176,10 +180,25 @@ kafkaTransport.on('logged', (info: LogEntry) => {
   console.log('Log sent:', info);
 });
 
-kafkaTransport.on('error', (error: Error) => {
+kafkaTransport.on('kafkaError', (error: Error) => {
   console.error('Kafka error:', error);
 });
 ```
+
+The transport never emits `'error'`: winston re-emits transport errors on the
+logger, which throws when nothing is listening. Connection failures, dropped
+logs and send failures are reported as `'kafkaError'` and `'warn'` instead.
+
+## Failure Behavior
+
+- `log()` acknowledges winston immediately and sends to Kafka in the background,
+  so a slow or unreachable broker never applies backpressure to the logger.
+- While disconnected, logs are queued up to `maxQueueSize`; beyond that they are
+  dropped and a single warning is emitted. On reconnect, the dropped count is
+  reported and the queue is flushed.
+- Disconnects are detected via the producer's `DISCONNECT` event and connection
+  errors on send; reconnects are retried every `reconnectInterval` ms.
+- `producerConfig.retry` defaults to `{ retries: 2 }` so failed sends settle quickly.
 
 ## Methods
 

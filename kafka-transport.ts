@@ -21,7 +21,7 @@ export interface KafkaTransportOptions extends Transport.TransportStreamOptions 
   /** Custom function to format log messages */
   messageFormatter?: (info: LogEntry) => any;
 
-  /** KafkaJS producer configuration */
+  /** KafkaJS producer configuration (default retry: { retries: 2 }) */
   producerConfig?: ProducerConfig;
 
   /** Full KafkaJS client configuration (overrides brokers/clientId) */
@@ -29,6 +29,9 @@ export interface KafkaTransportOptions extends Transport.TransportStreamOptions 
 
   /** Maximum messages to queue while disconnected (default: 1000) */
   maxQueueSize?: number;
+
+  /** Delay between reconnect attempts in ms (default: 5000) */
+  reconnectInterval?: number;
 }
 
 /**
@@ -41,17 +44,22 @@ interface FormattedLogMessage {
   [key: string]: any;
 }
 
-/**
- * Queued log entry waiting to be sent
- */
-interface QueuedLog {
-  info: LogEntry;
-  callback?: () => void;
-}
+const CONNECTION_ERRORS = new Set([
+  'KafkaJSConnectionError',
+  'KafkaJSConnectionClosedError',
+  'KafkaJSRequestTimeoutError',
+  'KafkaJSBrokerNotFound',
+]);
 
 /**
  * Custom Kafka Transport for Winston
- * Sends log messages to Apache Kafka topics with full TypeScript support
+ * Sends log messages to Apache Kafka topics with full TypeScript support.
+ *
+ * The transport never blocks the logger: winston's callback is invoked
+ * immediately and messages are sent in the background. While Kafka is
+ * unreachable, messages are buffered (up to maxQueueSize) and flushed on
+ * reconnect. Failures are reported via 'warn' and 'kafkaError' events,
+ * never 'error', because winston re-throws transport errors on the logger.
  */
 export class KafkaTransport extends Transport {
   private kafkaConfig: KafkaConfig;
@@ -63,8 +71,13 @@ export class KafkaTransport extends Transport {
   private producer: Producer;
   private connected: boolean = false;
   private connecting: boolean = false;
-  private messageQueue: QueuedLog[] = [];
+  private closing: boolean = false;
+  private flushing: boolean = false;
+  private messageQueue: LogEntry[] = [];
   private maxQueueSize: number;
+  private reconnectInterval: number;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private droppedCount: number = 0;
 
   constructor(opts: KafkaTransportOptions = {}) {
     super(opts);
@@ -74,17 +87,22 @@ export class KafkaTransport extends Transport {
       brokers: opts.brokers || ['localhost:9092'],
     };
 
-    this.producerConfig = opts.producerConfig || {};
+    this.producerConfig = { retry: { retries: 2 }, ...opts.producerConfig };
 
     this.topic = opts.topic || 'logs';
     this.keyField = opts.keyField || null;
 
     this.maxQueueSize = opts.maxQueueSize || 1000;
+    this.reconnectInterval = opts.reconnectInterval || 5000;
 
     this.messageFormatter = opts.messageFormatter || this.defaultFormatter.bind(this);
 
     this.kafka = new Kafka(this.kafkaConfig);
     this.producer = this.kafka.producer(this.producerConfig);
+
+    this.producer.on(this.producer.events.DISCONNECT, () => {
+      this.markDisconnected();
+    });
 
     this.connect();
   }
@@ -93,7 +111,7 @@ export class KafkaTransport extends Transport {
    * Connect to Kafka broker
    */
   private async connect(): Promise<void> {
-    if (this.connecting || this.connected) return;
+    if (this.connecting || this.connected || this.closing) return;
 
     this.connecting = true;
 
@@ -103,34 +121,106 @@ export class KafkaTransport extends Transport {
       this.connecting = false;
       this.emit('connected');
 
+      if (this.droppedCount > 0) {
+        this.warn(new Error(`Dropped ${this.droppedCount} log messages while disconnected from Kafka.`));
+        this.droppedCount = 0;
+      }
+
       await this.processQueue();
     } catch (error) {
       this.connecting = false;
-      this.emit('error', error);
-      setTimeout(() => this.connect(), 5000);
+      this.warn(error);
+      this.scheduleReconnect();
     }
+  }
+
+  /**
+   * Schedule a reconnect attempt; the timer does not keep the process alive
+   */
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || this.closing) return;
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, this.reconnectInterval);
+    this.reconnectTimer.unref();
+  }
+
+  /**
+   * Switch to queueing mode and start reconnecting
+   */
+  private markDisconnected(): void {
+    const wasConnected = this.connected;
+    this.connected = false;
+
+    if (wasConnected) {
+      this.emit('disconnected');
+    }
+
+    this.scheduleReconnect();
   }
 
   /**
    * Process queued messages
    */
   private async processQueue(): Promise<void> {
-    if (!this.connected || this.messageQueue.length === 0) return;
+    if (this.flushing) return;
+    this.flushing = true;
 
-    const queue = [...this.messageQueue];
-    this.messageQueue = [];
+    try {
+      while (this.connected && this.messageQueue.length > 0) {
+        const info = this.messageQueue.shift() as LogEntry;
 
-    for (const { info, callback } of queue) {
-      try {
-        await this.sendToKafka(info);
-      } catch (error) {
-        this.emit('error', error);
+        try {
+          await this.sendToKafka(info);
+        } catch (error) {
+          this.handleSendError(info, error, true);
+        }
       }
-
-      if (callback) {
-        callback();
-      }
+    } finally {
+      this.flushing = false;
     }
+  }
+
+  /**
+   * Buffer a message while disconnected, dropping it when the queue is full
+   */
+  private enqueue(info: LogEntry, front: boolean = false): void {
+    if (this.messageQueue.length < this.maxQueueSize) {
+      if (front) {
+        this.messageQueue.unshift(info);
+      } else {
+        this.messageQueue.push(info);
+      }
+      return;
+    }
+
+    if (this.droppedCount === 0) {
+      this.warn(new Error(`Message queue full (${this.maxQueueSize} messages). Dropping logs until Kafka reconnects.`));
+    }
+    this.droppedCount++;
+  }
+
+  /**
+   * Re-queue messages that failed due to connection problems, drop the rest
+   */
+  private handleSendError(info: LogEntry, error: unknown, front: boolean = false): void {
+    if (isConnectionError(error)) {
+      this.enqueue(info, front);
+      this.markDisconnected();
+      return;
+    }
+
+    this.warn(error);
+  }
+
+  /**
+   * Report a problem without emitting 'error' (winston re-throws it on the logger)
+   */
+  private warn(error: unknown): void {
+    this.emit('kafkaError', error);
+    this.emit('warn', error);
   }
 
   /**
@@ -170,44 +260,48 @@ export class KafkaTransport extends Transport {
   }
 
   /**
-   * Log method - sends log to Kafka or queues if not connected
+   * Log method - hands the log off to Kafka (or the queue) without blocking winston
    */
-  async log(info: LogEntry, callback: () => void): Promise<void> {
+  log(info: LogEntry, callback: () => void): void {
     setImmediate(() => {
       this.emit('logged', info);
     });
 
-    if (!this.connected) {
-      if (this.messageQueue.length < this.maxQueueSize) {
-        this.messageQueue.push({ info, callback });
-      } else {
-        const error = new Error(`Message queue full (${this.maxQueueSize} messages). Dropping log.`);
-        this.emit('warn', error);
-        if (callback) {
-          callback();
-        }
-      }
-      return;
-    }
-
-    try {
-      await this.sendToKafka(info);
-    } catch (error) {
-      this.emit('error', error);
-    }
-
     if (callback) {
       callback();
     }
+
+    if (this.closing) return;
+
+    if (!this.connected || this.flushing) {
+      this.enqueue(info);
+      return;
+    }
+
+    this.sendToKafka(info).catch((error) => this.handleSendError(info, error));
   }
 
   /**
    * Close the Kafka producer connection
    */
   async close(): Promise<void> {
-    if (this.connected) {
+    this.closing = true;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    const wasConnected = this.connected;
+    this.connected = false;
+
+    try {
       await this.producer.disconnect();
-      this.connected = false;
+    } catch (error) {
+      this.warn(error);
+    }
+
+    if (wasConnected) {
       this.emit('disconnected');
     }
   }
@@ -218,6 +312,17 @@ export class KafkaTransport extends Transport {
   isConnected(): boolean {
     return this.connected;
   }
+}
+
+function isConnectionError(error: unknown): boolean {
+  let current: any = error;
+
+  for (let depth = 0; current && depth < 5; depth++) {
+    if (CONNECTION_ERRORS.has(current.name)) return true;
+    current = current.originalError || current.cause;
+  }
+
+  return false;
 }
 
 export default KafkaTransport;
